@@ -1,5 +1,5 @@
 using Pkg
-Pkg.add("ColorSchemes")
+Pkg.add("Plots")
 
 using Plots
 using LinearAlgebra
