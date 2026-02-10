@@ -529,7 +529,7 @@ println("="^70)
 # ------------------------------------------------------------
 
 println("\nDIAGNOSTIC INFORMATION:")
-println("-" * 40)
+println("\n" * "-"^40)
 
 # Check for singular or near-singular matrices
 println("\nChecking for ill-conditioned matrices:")
