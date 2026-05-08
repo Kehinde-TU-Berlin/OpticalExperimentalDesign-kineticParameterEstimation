@@ -410,6 +410,13 @@ function safe_inv_oed(A; λ=1e-8)
     return inv(Matrix(A) + λ * I(n))
 end
 
+function oed_safe_nref(; ratio, requested_nref, min_catalyst_nodes=5)
+    L = 0.1
+    λ = L * ratio
+    needed = ceil(Int, 1 + min_catalyst_nodes / λ)
+    return max(requested_nref, needed, 350)
+end
+
 function safe_logdet_oed(A; λ=1e-8)
     n = size(A, 1)
     return logdet(Symmetric(Matrix(A) + λ * I(n)))
@@ -484,8 +491,8 @@ function build_candidate_database_oed(; Y_candidates, Temp_candidates,
     return Yclean, Jlist
 end
 
-function candidate_fim_oed(J; noise_percent)
-    σ = max(noise_percent / 100, 1e-8)
+function candidate_fim_oed(J; noise_percent, yscale=1.0)
+    σ = noise_percent == 0.0 ? 1e-8 : max(noise_percent / 100 * yscale, 1e-8)
     W = (1 / σ^2) * I(size(J, 1))
     return Matrix(J' * W * J)
 end
@@ -494,20 +501,26 @@ function select_random_oed(; Nexps)
     return collect(1:Nexps)
 end
 
-function select_fim_oed(; Jlist, noise_percent, Nexps)
+function select_fim_oed(; Jlist, Yclean, noise_percent, Nexps)
     nparas = size(Jlist[1], 2)
     F = zeros(nparas, nparas)
 
     selected = Int[]
     remaining = collect(1:length(Jlist))
 
-    while length(selected) < Nexps
-        @show best_idx = remaining[1]
+    while length(selected) < Nexps && !isempty(remaining)
+        best_idx = remaining[1]
         best_score = -Inf
 
         for idx in remaining
-            Fi = candidate_fim_oed(Jlist[idx]; noise_percent=noise_percent)
-            score = safe_logdet_oed(F + Fi)
+            yscale = maximum(abs.(Yclean[:, idx]))
+            Fi = candidate_fim_oed(Jlist[idx]; noise_percent=noise_percent, yscale=yscale)
+
+            Ftest = F + Fi
+
+            score =
+                safe_logdet_oed(Ftest; λ=1e-6) -
+                1e-4 * tr(safe_inv_oed(Ftest; λ=1e-6))
 
             if score > best_score
                 best_score = score
@@ -516,37 +529,48 @@ function select_fim_oed(; Jlist, noise_percent, Nexps)
         end
 
         push!(selected, best_idx)
-        F .+= candidate_fim_oed(Jlist[best_idx]; noise_percent=noise_percent)
+
+        yscale = maximum(abs.(Yclean[:, best_idx]))
+        F .+= candidate_fim_oed(Jlist[best_idx]; noise_percent=noise_percent, yscale=yscale)
+
         filter!(x -> x != best_idx, remaining)
     end
 
     return selected
 end
 
-function select_gim_oed(; Jlist, noise_percent, Nexps)
-    Fims = [
-        candidate_fim_oed(Jlist[i]; noise_percent=noise_percent)
-        for i in 1:length(Jlist)
-    ]
+function select_gim_oed(; Jlist, Yclean, noise_percent, Nexps)
+    Ncandidates = length(Jlist)
+    nparas = size(Jlist[1], 2)
+
+    Fims = Matrix{Float64}[]
+
+    for i in 1:Ncandidates
+        yscale = maximum(abs.(Yclean[:, i]))
+        push!(Fims, candidate_fim_oed(Jlist[i]; noise_percent=noise_percent, yscale=yscale))
+    end
 
     GIM = sum(Fims)
+    GIMinv = safe_inv_oed(GIM; λ=1e-6)
 
     selected = Int[]
-    remaining = collect(1:length(Jlist))
+    remaining = collect(1:Ncandidates)
 
-    nparas = size(GIM, 1)
     F = zeros(nparas, nparas)
 
-    while length(selected) < Nexps
+    while length(selected) < Nexps && !isempty(remaining)
         best_idx = remaining[1]
         best_score = -Inf
 
         for idx in remaining
-            Ftest = F + Fims[idx]
+            Fi = Fims[idx]
+            Ftest = F + Fi
 
-            score =
-                safe_logdet_oed(Ftest) -
-                tr(safe_inv_oed(Ftest) * GIM)
+            d_score = safe_logdet_oed(Ftest; λ=1e-6)
+            global_score = tr(GIMinv * Fi)
+            conditioning_penalty = tr(safe_inv_oed(Ftest; λ=1e-6))
+
+            score = d_score + global_score - 1e-4 * conditioning_penalty
 
             if score > best_score
                 best_score = score
@@ -562,7 +586,7 @@ function select_gim_oed(; Jlist, noise_percent, Nexps)
     return selected
 end
 
-function fim_history_oed(; selected, Jlist, noise_percent)
+function fim_history_oed(; selected, Jlist, Yclean, noise_percent)
     nparas = size(Jlist[1], 2)
     F = zeros(nparas, nparas)
 
@@ -570,9 +594,13 @@ function fim_history_oed(; selected, Jlist, noise_percent)
     unc_hist = zeros(length(selected))
 
     for i in 1:length(selected)
-        F .+= candidate_fim_oed(Jlist[selected[i]]; noise_percent=noise_percent)
-        fim_hist[i] = safe_logdet_oed(F)
-        unc_hist[i] = tr(safe_inv_oed(F))
+        idx = selected[i]
+        yscale = maximum(abs.(Yclean[:, idx]))
+
+        F .+= candidate_fim_oed(Jlist[idx]; noise_percent=noise_percent, yscale=yscale)
+
+        fim_hist[i] = safe_logdet_oed(F; λ=1e-6)
+        unc_hist[i] = tr(safe_inv_oed(F; λ=1e-6))
     end
 
     return fim_hist, unc_hist
@@ -785,6 +813,8 @@ function cfd_oed_parameter_estimator_workflow(; Nexps=5,
                                               RBS_full=false)
 
     St = [-2 -1 2]
+    nref = oed_safe_nref(ratio=ratio, requested_nref=nref)
+    @info "Using safe CFD nref = $nref"
     nspec = size(St, 2)
 
     noise_levels = [0.0, 5.0]    # add , 10.0, 20.0]
@@ -820,12 +850,14 @@ function cfd_oed_parameter_estimator_workflow(; Nexps=5,
 
         selected_fim = select_fim_oed(
             Jlist=Jlist,
+            Yclean=Yclean,
             noise_percent=noise,
             Nexps=Nexps
         )
 
         selected_gim = select_gim_oed(
             Jlist=Jlist,
+            Yclean=Yclean,
             noise_percent=noise,
             Nexps=Nexps
         )
@@ -843,6 +875,7 @@ function cfd_oed_parameter_estimator_workflow(; Nexps=5,
             fim_hist, unc_hist = fim_history_oed(
                 selected=selected,
                 Jlist=Jlist,
+                Yclean=Yclean,
                 noise_percent=noise
             )
 
